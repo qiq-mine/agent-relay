@@ -18,7 +18,18 @@ SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "delegate.py"
 SPEC = importlib.util.spec_from_file_location("delegate_under_test", SCRIPT_PATH)
 DELEGATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DELEGATE)
-RUNNERS = ("claude", "workbuddy", "antigravity", "codex", "opencode", "dsh", "grok", "kimi")
+RUNNERS = (
+    "claude",
+    "workbuddy",
+    "antigravity",
+    "codex",
+    "opencode",
+    "dsh",
+    "grok",
+    "kimi",
+    "zcode",
+    "commandcode",
+)
 
 FAKE_CLI = r'''#!{python}
 import json
@@ -90,6 +101,31 @@ if os.environ.get("FAKE_EMPTY") == "1":
         print(json.dumps({{"type": "session", "sessionId": session}}))
         print(json.dumps({{"type": "status", "phase": "turn_end", "reason": {{"kind": "completed"}}}}))
         print(json.dumps({{"type": "final", "text": ""}}))
+    elif runner == "zcode":
+        print(json.dumps({{"sessionId": session, "response": "", "projection": {{"status": "idle"}}}}))
+    elif runner == "commandcode":
+        print(json.dumps({{"type": "event", "event": {{"type": "tool_running", "toolName": "read_file"}}}}))
+        print(json.dumps({{"type": "result", "subtype": "success", "sessionId": session, "stopReason": "end_turn", "finalText": ""}}))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_ZCODE_ERROR"):
+    err_kind = os.environ["FAKE_ZCODE_ERROR"]
+    if err_kind == "no_model":
+        print(json.dumps({{"type": "error", "message": "Select a model before continuing"}}))
+    elif err_kind == "quota":
+        print(json.dumps({{"sessionId": session, "error": {{"code": 1113, "message": "Insufficient balance"}}}}))
+    elif err_kind == "proj_failed":
+        print(json.dumps({{"sessionId": session, "response": "partial", "projection": {{"status": "failed", "error": "tool crashed"}}}}))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_COMMANDCODE_ERROR"):
+    err_kind = os.environ["FAKE_COMMANDCODE_ERROR"]
+    if err_kind == "auth":
+        print(json.dumps({{"type": "result", "subtype": "error", "error": "Authentication required"}}))
+    elif err_kind == "max_turns":
+        print(json.dumps({{"type": "result", "subtype": "max_turns", "sessionId": session, "finalText": "partial"}}))
+    elif err_kind == "no_result":
+        print(json.dumps({{"type": "event", "event": {{"type": "tool_running", "toolName": "read_file"}}}}))
     raise SystemExit(0)
 
 if os.environ.get("FAKE_CODEX_FAIL_NO_DETAIL") == "1":
@@ -117,6 +153,11 @@ elif runner == "dsh":
     print(json.dumps({{"type": "text", "text": "fake response"}}))
     print(json.dumps({{"type": "status", "phase": "turn_end", "reason": {{"kind": "completed"}}}}))
     print(json.dumps({{"type": "final", "text": "fake response"}}))
+elif runner == "zcode":
+    print(json.dumps({{"sessionId": session, "response": "fake response", "usage": {{"totalTokens": 42}}, "projection": {{"status": "idle"}}}}))
+elif runner == "commandcode":
+    print(json.dumps({{"type": "event", "event": {{"type": "tool_running", "toolCallId": "tc_1", "toolName": "read_file"}}}}))
+    print(json.dumps({{"type": "result", "subtype": "success", "sessionId": session, "stopReason": "end_turn", "durationMs": 120, "finalText": "fake response"}}))
 '''
 
 
@@ -220,7 +261,7 @@ class DelegateTestCase(unittest.TestCase):
     def record_of(self) -> dict:
         return json.loads((self.root / "record.json").read_text(encoding="utf-8"))
 
-    def test_scan_is_read_only_and_reports_eight_runners(self) -> None:
+    def test_scan_is_read_only_and_reports_ten_runners(self) -> None:
         result = self.run_cli("onboard", "--scan")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         payload = json.loads(result.stdout)
@@ -320,7 +361,7 @@ class DelegateTestCase(unittest.TestCase):
         onboard = self.run_cli(
             "onboard",
             "--enable",
-            "cc,wb,agy,dsh,claude,grok-build,kimi-code",
+            "cc,wb,agy,dsh,claude,grok-build,kimi-code,zc,cmd",
             "--default-runner",
             "CC",
         )
@@ -328,7 +369,7 @@ class DelegateTestCase(unittest.TestCase):
         payload = json.loads(onboard.stdout)
         self.assertEqual(
             payload["enabled_runners"],
-            ["claude", "workbuddy", "antigravity", "dsh", "grok", "kimi"],
+            ["claude", "workbuddy", "antigravity", "dsh", "grok", "kimi", "zcode", "commandcode"],
         )
         self.assertEqual(payload["default_runner"], "claude")
         self.assertIn("cc", payload["detected_runners"]["claude"]["aliases"])
@@ -336,8 +377,19 @@ class DelegateTestCase(unittest.TestCase):
         self.assertIn("anti", payload["detected_runners"]["antigravity"]["aliases"])
         self.assertIn("grok-build", payload["detected_runners"]["grok"]["aliases"])
         self.assertIn("kimi-code", payload["detected_runners"]["kimi"]["aliases"])
+        self.assertIn("zc", payload["detected_runners"]["zcode"]["aliases"])
+        self.assertIn("zcode-cli", payload["detected_runners"]["zcode"]["aliases"])
+        self.assertIn("cmd", payload["detected_runners"]["commandcode"]["aliases"])
+        self.assertIn("command-code", payload["detected_runners"]["commandcode"]["aliases"])
+        self.assertIn("cmdc", payload["detected_runners"]["commandcode"]["aliases"])
 
-        for alias, canonical in (("wb", "workbuddy"), ("kimi-code", "kimi"), ("anti", "antigravity")):
+        for alias, canonical in (
+            ("wb", "workbuddy"),
+            ("kimi-code", "kimi"),
+            ("anti", "antigravity"),
+            ("zc", "zcode"),
+            ("cmd", "commandcode"),
+        ):
             with self.subTest(alias=alias):
                 proc = self.run_task(alias, mode="write")
                 self.assertEqual(proc.returncode, 0, msg=proc.stderr)
@@ -374,6 +426,8 @@ class DelegateTestCase(unittest.TestCase):
             "opencode": ["--agent", "plan"],
             "dsh": ["--permission-mode", "read-only"],
             "grok": ["--permission-mode", "plan"],
+            "zcode": ["--mode", "plan"],
+            "commandcode": ["--permission-mode", "plan"],
         }
         expected_write = {
             "claude": ["--dangerously-skip-permissions"],
@@ -384,6 +438,8 @@ class DelegateTestCase(unittest.TestCase):
             "dsh": ["--permission-mode", "danger-full-access"],
             "grok": ["--always-approve"],
             "kimi": [],
+            "zcode": ["--mode", "yolo"],
+            "commandcode": ["--yolo"],
         }
         resume_flags = {
             "claude": "--resume",
@@ -394,6 +450,8 @@ class DelegateTestCase(unittest.TestCase):
             "dsh": "--session-id",
             "grok": "--resume",
             "kimi": "-S",
+            "zcode": "--resume",
+            "commandcode": "--resume",
         }
 
         for runner in RUNNERS:
@@ -646,6 +704,8 @@ class DelegateTestCase(unittest.TestCase):
             "dsh": "tui --resume fake-dsh-session",
             "grok": "--resume fake-grok-session",
             "kimi": "-S fake-kimi-session",
+            "zcode": "--resume fake-zcode-session",
+            "commandcode": "--resume fake-commandcode-session",
         }
         for runner, command in expected.items():
             mode = "write" if runner == "kimi" else "read"
@@ -840,6 +900,110 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(result["events_path"], result["raw_stdout_path"])
         self.assertTrue(Path(result["events_path"]).is_file())
         self.assertNotIn("run_timeout_seconds", DELEGATE.default_config())
+
+    def test_zcode_error_payloads_are_failures(self) -> None:
+        self.onboard_all()
+        for err_kind, expected_msg in (
+            ("no_model", "Select a model before continuing"),
+            ("quota", "Insufficient balance"),
+            ("proj_failed", "tool crashed"),
+        ):
+            with self.subTest(err_kind=err_kind):
+                proc = self.run_task("zcode", extra_env={"FAKE_ZCODE_ERROR": err_kind})
+                self.assertNotEqual(proc.returncode, 0)
+                result = self.result_of(proc)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(expected_msg, result["error"])
+
+    def test_zcode_cjs_script_via_node_config_run_and_resume(self) -> None:
+        if not DELEGATE.find_node_binary():
+            self.skipTest("node is not available")
+        cjs_path = self.root / "zcode.cjs"
+        cjs_path.write_text(
+            "\n".join(
+                [
+                    "const args = process.argv.slice(2);",
+                    "if (args.includes('--version')) { console.log('zcode-cjs-0.16.0'); process.exit(0); }",
+                    "const resumeIdx = args.indexOf('--resume');",
+                    "const sid = resumeIdx >= 0 ? args[resumeIdx + 1] : 'sess_cjs_123';",
+                    "const modeIdx = args.indexOf('--mode');",
+                    "const mode = modeIdx >= 0 ? args[modeIdx + 1] : '';",
+                    "console.log(JSON.stringify({ sessionId: sid, response: 'cjs ok:' + mode, projection: { status: 'idle' } }));",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Intentionally leave zcode.cjs non-executable (0o644) like desktop bundles.
+        cjs_path.chmod(0o644)
+
+        configured = self.run_cli(
+            "config",
+            "--set-bin",
+            f"zc={cjs_path}",
+            "--set-default-runner",
+            "zc",
+            remove_env=["OIL_DELEGATE_ZCODE_BIN"],
+        )
+        self.assertEqual(configured.returncode, 0, msg=configured.stderr)
+        cfg_payload = json.loads(configured.stdout)
+        self.assertEqual(cfg_payload["default_runner"], "zcode")
+        self.assertEqual(cfg_payload["detected_runners"]["zcode"]["version"], "zcode-cjs-0.16.0")
+
+        ran = self.run_cli(
+            "run",
+            "--runner",
+            "zc",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "check cjs",
+            "--json",
+            remove_env=["OIL_DELEGATE_ZCODE_BIN"],
+        )
+        self.assertEqual(ran.returncode, 0, msg=ran.stdout + ran.stderr)
+        payload = json.loads(ran.stdout)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["session_id"], "sess_cjs_123")
+        self.assertEqual(payload["response"], "cjs ok:plan")
+        self.assertEqual(payload["resume_command"], f"node {shlex.quote(str(cjs_path))} --resume sess_cjs_123")
+        self.assertEqual(payload["command"][1], str(cjs_path))
+
+        resumed = self.run_cli(
+            "run",
+            "--runner",
+            "zcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "write",
+            "--session",
+            "sess_cjs_123",
+            "--prompt",
+            "apply fix",
+            "--json",
+            remove_env=["OIL_DELEGATE_ZCODE_BIN"],
+        )
+        self.assertEqual(resumed.returncode, 0, msg=resumed.stdout + resumed.stderr)
+        resumed_payload = json.loads(resumed.stdout)
+        self.assertEqual(resumed_payload["response"], "cjs ok:yolo")
+        self.assertIn("--resume", resumed_payload["command"])
+
+    def test_commandcode_ndjson_errors_and_non_success_subtypes(self) -> None:
+        self.onboard_all()
+        for err_kind, expected_msg in (
+            ("auth", "Authentication required"),
+            ("max_turns", "max_turns"),
+            ("no_result", "without a result frame"),
+        ):
+            with self.subTest(err_kind=err_kind):
+                proc = self.run_task("commandcode", extra_env={"FAKE_COMMANDCODE_ERROR": err_kind})
+                self.assertNotEqual(proc.returncode, 0)
+                result = self.result_of(proc)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(expected_msg, result["error"])
 
 
 if __name__ == "__main__":

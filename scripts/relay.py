@@ -30,6 +30,8 @@ SUPPORTED_RUNNERS = (
     "dsh",
     "grok",
     "kimi",
+    "zcode",
+    "commandcode",
 )
 RUNNER_LABELS = {
     "claude": "Claude Code (claude/cc)",
@@ -40,6 +42,8 @@ RUNNER_LABELS = {
     "dsh": "DeepSeek Harness (dsh)",
     "grok": "Grok Build (grok)",
     "kimi": "Kimi Code (kimi)",
+    "zcode": "ZCode (zcode/zc)",
+    "commandcode": "Command Code (command-code/cmd/cmdc)",
 }
 RUNNER_BINARIES = {
     "claude": ("claude",),
@@ -50,6 +54,12 @@ RUNNER_BINARIES = {
     "dsh": ("dsh",),
     "grok": ("grok",),
     "kimi": ("kimi",),
+    "zcode": ("zcode", "zc"),
+    "commandcode": (
+        ("command-code", "commandcode", "cmdc")
+        if sys.platform == "win32"
+        else ("command-code", "commandcode", "cmd", "cmdc")
+    ),
 }
 RUNNER_ALIASES = {
     "cc": "claude",
@@ -63,6 +73,12 @@ RUNNER_ALIASES = {
     "deepseek-harness": "dsh",
     "grok-build": "grok",
     "kimi-code": "kimi",
+    "zc": "zcode",
+    "zcode-cli": "zcode",
+    "command-code": "commandcode",
+    "cmd": "commandcode",
+    "cmdc": "commandcode",
+    "cmdcode": "commandcode",
 }
 # Bump when the `run --json` result fields change incompatibly.
 CONTRACT_VERSION = 1
@@ -76,7 +92,10 @@ RESUME_TEMPLATES = {
     "dsh": ("{bin}", "tui", "--resume", "{sid}"),
     "grok": ("{bin}", "--resume", "{sid}"),
     "kimi": ("{bin}", "-S", "{sid}"),
+    "zcode": ("{bin}", "--resume", "{sid}"),
+    "commandcode": ("{bin}", "--resume", "{sid}"),
 }
+NODE_SCRIPT_SUFFIXES = (".cjs", ".js", ".mjs")
 EXIT_NEEDS_ONBOARDING = 10
 EXIT_NEEDS_RUNNER_CHOICE = 11
 EXIT_NEEDS_ROLE_CHOICE = 12
@@ -195,6 +214,71 @@ def is_executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+def is_node_script(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in NODE_SCRIPT_SUFFIXES
+
+
+def find_node_binary() -> str | None:
+    found = shutil.which("node")
+    if found and is_executable(Path(found)):
+        return found
+    home = Path.home()
+    for directory in (
+        home / ".local" / "bin",
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+    ):
+        candidate = directory / "node"
+        if is_executable(candidate):
+            return str(candidate.resolve())
+    return None
+
+
+def is_runner_usable(runner: str, path: Path) -> tuple[bool, str | None]:
+    if runner == "zcode" and is_node_script(path):
+        if find_node_binary():
+            return True, None
+        return False, "Node.js ('node') is required to run ZCode .cjs/.js runtime but was not found"
+    if is_executable(path):
+        return True, None
+    return False, None
+
+
+def runner_exec_prefix(runner: str, binary: str) -> list[str]:
+    path = Path(binary)
+    if runner == "zcode" and is_node_script(path):
+        node_bin = find_node_binary()
+        if not node_bin:
+            raise DelegateError(
+                "Node.js ('node') is required to run ZCode .cjs/.js runtime but was not found"
+            )
+        return [node_bin, binary]
+    return [binary]
+
+
+def zcode_app_candidates() -> list[Path]:
+    home = Path.home()
+    if sys.platform == "darwin":
+        return [
+            Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+            home / "Applications" / "ZCode.app" / "Contents" / "Resources" / "glm" / "zcode.cjs",
+        ]
+    if sys.platform == "win32":
+        candidates: list[Path] = []
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(
+                Path(local_app_data) / "Programs" / "ZCode" / "resources" / "glm" / "zcode.cjs"
+            )
+        candidates.append(Path(r"C:\Program Files\ZCode\resources\glm\zcode.cjs"))
+        return candidates
+    return [
+        Path("/opt/ZCode/resources/glm/zcode.cjs"),
+        Path("/usr/lib/zcode/resources/glm/zcode.cjs"),
+        home / ".local" / "share" / "ZCode" / "resources" / "glm" / "zcode.cjs",
+    ]
+
+
 def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
     env_key = f"AGENT_RELAY_{runner.upper()}_BIN"
     legacy_key = f"OIL_DELEGATE_{runner.upper()}_BIN"
@@ -204,11 +288,12 @@ def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
     source = "environment" if env_val else "config"
     if configured:
         path = Path(configured).expanduser().resolve()
+        usable, reason = is_runner_usable(runner, path)
         return {
-            "installed": is_executable(path),
+            "installed": usable,
             "path": str(path),
             "source": source,
-            "error": None if is_executable(path) else f"{active_key} or configured path is not executable",
+            "error": None if usable else (reason or f"{active_key} or configured path is not executable"),
         }
 
     for binary in RUNNER_BINARIES[runner]:
@@ -246,6 +331,17 @@ def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
                 "error": None,
             }
 
+    if runner == "zcode":
+        for candidate in zcode_app_candidates():
+            if is_node_script(candidate):
+                usable, reason = is_runner_usable(runner, candidate)
+                return {
+                    "installed": usable,
+                    "path": str(candidate),
+                    "source": "zcode-app",
+                    "error": None if usable else reason,
+                }
+
     return {
         "installed": False,
         "path": None,
@@ -254,16 +350,17 @@ def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def probe_version(path: str) -> dict[str, Any]:
+def probe_version(path: str, runner: str = "") -> dict[str, Any]:
     try:
+        cmd = [*runner_exec_prefix(runner, path), "--version"]
         proc = subprocess.run(
-            [path, "--version"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, DelegateError) as exc:
         return {"version": None, "probe_error": str(exc)}
     output = (proc.stdout or proc.stderr or "").strip()
     return {
@@ -317,7 +414,7 @@ def scan_runners(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "probe_error": None,
         }
         if info["installed"]:
-            info.update(probe_version(info["path"]))
+            info.update(probe_version(info["path"], runner))
             if runner == "dsh":
                 info["capabilities"] = probe_dsh_capabilities(info["path"])
         result[runner] = info
@@ -553,8 +650,9 @@ def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
     for assignment in args.set_bin or []:
         runner, raw_path = parse_bin_assignment(assignment)
         path = Path(raw_path).expanduser().resolve()
-        if not is_executable(path):
-            raise DelegateError(f"Not executable: {path}")
+        usable, reason = is_runner_usable(runner, path)
+        if not usable:
+            raise DelegateError(reason or f"Not executable: {path}")
         paths = dict(config.get("runner_paths", {}))
         paths[runner] = str(path)
         config["runner_paths"] = paths
@@ -734,14 +832,33 @@ def build_invocation(
         cmd.extend(["--json", "-"])
         return cmd, prompt, env
 
+    if runner == "zcode":
+        cmd = [*runner_exec_prefix("zcode", binary), "--cwd", str(workspace)]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        cmd.extend(["-p", prompt, "--json"])
+        cmd.extend(["--mode", "plan"] if mode == "read" else ["--mode", "yolo"])
+        return cmd, stdin_input, env
+
+    if runner == "commandcode":
+        cmd = [binary]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        cmd.extend(["-p", prompt, "--output-format", "json"])
+        cmd.extend(["--permission-mode", "plan"] if mode == "read" else ["--yolo"])
+        return cmd, stdin_input, env
+
     raise DelegateError(f"Unsupported runner: {runner}")
 
 
 def resume_command(runner: str, binary: str, session_id: str | None) -> str | None:
     if not session_id:
         return None
+    path = Path(binary)
+    if runner == "zcode" and is_node_script(path):
+        return shlex.join(["node", binary, "--resume", session_id])
     # Standard executable names stay short; custom paths are kept in full so the command still works.
-    name = Path(binary).name if Path(binary).name in RUNNER_BINARIES[runner] else binary
+    name = path.name if path.name in RUNNER_BINARIES[runner] else binary
     return shlex.join(part.format(bin=name, sid=session_id) for part in RESUME_TEMPLATES[runner])
 
 
@@ -935,6 +1052,79 @@ def parse_runner_output(
             if not error:
                 error = "DSH stream ended without a final event"
         protocol_ok = bool(session_id and final and not error)
+
+    elif runner == "zcode":
+        obj = json_object(raw_out)
+        if not obj:
+            protocol_ok = False
+            error = "CLI did not return a JSON result"
+        else:
+            session_id = obj.get("sessionId") or nested_session_id(obj) or session_id
+            if not session_id:
+                for event in json_events(raw_out):
+                    session_id = nested_session_id(event) or session_id
+            raw_response = obj.get("response")
+            if raw_response is None:
+                raw_response = obj.get("result")
+            if raw_response is None:
+                raw_response = obj.get("text")
+            response = str(raw_response or "")
+            projection = obj.get("projection") if isinstance(obj.get("projection"), dict) else {}
+            proj_status = str(projection.get("status") or "").lower()
+            obj_status = str(obj.get("status") or "").lower()
+            if obj.get("type") in ("error", "turn.failed"):
+                error = error_message(obj.get("error") or obj.get("message") or obj)
+            elif obj.get("is_error") or obj.get("error"):
+                error = error_message(
+                    obj.get("error") or obj.get("message") or response or "ZCode reported an error"
+                )
+            elif obj_status in ("error", "failed", "cancelled") or proj_status in (
+                "error",
+                "failed",
+                "cancelled",
+            ):
+                error = error_message(
+                    obj.get("message") or projection.get("error") or obj_status or proj_status
+                )
+            protocol_ok = bool(session_id and (response or error))
+
+    elif runner == "commandcode":
+        result_frame: dict[str, Any] | None = None
+        for event in json_events(raw_out):
+            session_id = event.get("sessionId") or nested_session_id(event) or session_id
+            if event.get("type") == "result":
+                result_frame = event
+            elif event.get("type") == "error":
+                error = error_message(event.get("error") or event.get("message") or event)
+        if not result_frame:
+            protocol_ok = False
+            if not error:
+                error = "Command Code stream ended without a result frame"
+        else:
+            session_id = result_frame.get("sessionId") or nested_session_id(result_frame) or session_id
+            raw_text = result_frame.get("finalText")
+            if raw_text is None:
+                raw_text = result_frame.get("result")
+            if raw_text is None:
+                raw_text = result_frame.get("text")
+            response = str(raw_text or "")
+            subtype = str(result_frame.get("subtype") or "").lower()
+            if subtype == "error" or result_frame.get("error"):
+                error = error_message(
+                    result_frame.get("error")
+                    or result_frame.get("message")
+                    or response
+                    or "Command Code reported an error"
+                )
+            elif subtype and subtype != "success":
+                error = error_message(
+                    result_frame.get("error")
+                    or result_frame.get("message")
+                    or f"Command Code run ended with subtype '{subtype}'"
+                )
+            elif result_frame.get("stopReason") in ("cancelled", "refusal", "error"):
+                error = error_message(result_frame.get("error") or result_frame.get("stopReason"))
+            protocol_ok = bool(session_id and not error and subtype in ("", "success") and response)
 
     status = (
         "completed"

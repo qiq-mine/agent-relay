@@ -13,11 +13,13 @@
 - [DeepSeek Harness](#deepseek-harness)
 - [Grok Build](#grok-build)
 - [Kimi Code](#kimi-code)
+- [ZCode](#zcode)
+- [Command Code](#command-code)
 - [失败处理](#失败处理)
 
 ## 共同约束
 
-正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy/anti`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`。名称不区分大小写；启用、默认 Runner、单次委托和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
+正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`、`zcode`、`commandcode`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy/anti`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`、`zc/zcode-cli`、`command-code/cmd/cmdc/cmdcode`。名称不区分大小写；启用、默认 Runner、单次委托和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
 
 优先级：环境变量 `AGENT_RELAY_<RUNNER>_BIN`（兼容 `OIL_DELEGATE_<RUNNER>_BIN`）→ 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell。常规调用不指定模型、provider 或思考强度。
 
@@ -116,6 +118,28 @@
 - 认证：复用 Kimi Code 已有登录；静态 deny 规则仍然有效，登录由官方 CLI 另行完成。
 
 官方参考：[Kimi Command](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/kimi-command.html)。
+
+## ZCode
+
+- 发现：PATH 中的 `zcode` 或 `zc`；未安装独立 CLI 时自动探测桌面端内置无头脚本 `zcode.cjs`（Linux `/opt/ZCode/resources/glm/zcode.cjs`、macOS `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`、Windows `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`）。也可通过 `AGENT_RELAY_ZCODE_BIN` 或 `config --set-bin zcode=/path/to/zcode.cjs` 指定；遇到 `.cjs/.js/.mjs` 脚本时自动使用本机 `node` 启动。Runner 名为 `zcode`，接受 `zc`、`zcode-cli`。
+- 新建：`zcode --cwd <workspace> -p <prompt> --json`（或 `node <zcode.cjs> --cwd <workspace> -p <prompt> --json`）；续接增加 `--resume <sessionId>`。
+- read：`--mode plan`。
+- write：`--mode yolo`。
+- 解析：最终 JSON 的 `sessionId`、`response`（兼容 `result`/`text`）与 `projection` 状态；`type: "error"` / `turn.failed`、`error`、`is_error` 或失败态 `status` 均判为失败。
+- 认证与默认模型：复用 ZCode 本地认证与 `~/.zcode/v2/provider_config.json` 中的 `defaultModelSelection` 配置；若提示未选择模型或未登录，先在官方客户端/CLI 中完成认证与默认模型设置。
+
+官方参考：[ZCode (Z.ai)](https://github.com/zai-org/ZCode)。
+
+## Command Code
+
+- 发现：PATH 中的 `command-code`、`commandcode`、`cmd`（仅 macOS/Linux/WSL，Windows 上自动跳过 `cmd` 以免误命中系统 `cmd.exe`）或 `cmdc`。Runner 名为 `commandcode`，接受 `command-code`、`cmd`、`cmdc`、`cmdcode`。
+- 新建：`command-code -p <prompt> --output-format json`（以目标 workspace 为 cwd）；续接增加 `--resume <sessionId>`。
+- read：`--permission-mode plan`（只读规划模式，且 headless 默认禁止写入/命令修改）。
+- write：`--yolo`（等价 `--dangerously-skip-permissions`，放行写入与命令执行；静态 `deny` 规则与安全熔断仍有效）。
+- 解析：NDJSON 流中的最终 `type: "result"` 帧，读取 `sessionId`、`finalText`、`subtype`（仅 `success` 视为成功；`error`、`max_turns` 或缺少 `result` 帧均判失败）与 `error`。
+- 认证：本地通过 `cmd login` 缓存认证（`~/.commandcode/auth.json`），无头/CI 环境可使用 `COMMAND_CODE_API_KEY` 环境变量；包装器不读取或转存密钥。
+
+官方参考：[Command Code Docs](https://commandcode.ai/docs)。
 
 ## 失败处理
 

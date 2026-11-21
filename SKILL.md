@@ -1,6 +1,6 @@
 ---
 name: agent-relay
-description: "一句话把边界清楚的任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）或 Kimi Code（kimi）CLI，返回结构化结果并续接原会话；支持静默扫描、启用执行器与默认选择，并可按用途（代码审查、方案挑刺、疑难会诊、工程实现）记住各角色分工。用户要求 agent-relay、跨 Agent 委托、统一调用或调用上述外部 CLI Agent 时使用；不用于普通直接问答或显式 /codex。"
+description: "一句话把边界清楚的任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）、Kimi Code（kimi）、ZCode（zcode/zc）或 Command Code（commandcode/cmd）CLI，返回结构化结果并续接原会话；支持静默扫描、启用执行器与默认选择，并可按用途（代码审查、方案挑刺、疑难会诊、工程实现）记住各角色分工。用户要求 agent-relay、跨 Agent 委托、统一调用或调用上述外部 CLI Agent 时使用；不用于普通直接问答或显式 /codex。"
 license: MIT
 metadata:
   version: "1.0.0"
@@ -51,7 +51,7 @@ metadata:
 2. 展示已安装 runner、版本、来源、能力和 aliases，说明“已安装不等于已认证”。首次配置前读 [Runner 适配参考](references/runners.md)，讲清 read/write 权限差异、外部服务费用与任务文本会交给对应 provider。
 3. 询问启用哪些 runner，以及默认使用一个还是每次询问。得到回答后才保存：
    ```text
-   RELAY onboard --enable <claude,workbuddy,antigravity,codex,opencode,dsh,grok,kimi> --default-runner <runner|ask>
+   RELAY onboard --enable <claude,workbuddy,antigravity,codex,opencode,dsh,grok,kimi,zcode,commandcode> --default-runner <runner|ask>
    ```
 
 名称不区分大小写，启用、默认项、委托和二进制路径配置都走同一套别名解析，保存时统一转为正式 Runner 名；完整映射见 [Runner 适配参考](references/runners.md)。
@@ -139,4 +139,4 @@ RELAY run --runner <原 runner> \
 
 - [references/runners.md](references/runners.md)：各 CLI 启动参数、权限机制、续接命令与官方参考文档。
 - [scripts/relay.py](scripts/relay.py)：扫描、配置、调用、解析与产物管理的确定性 Python 工具。
-- [tests/test_delegate.py](tests/test_delegate.py)：八种 Runner 的完整自动化回归测试套件。
+- [tests/test_delegate.py](tests/test_delegate.py)：十种 Runner 的完整自动化回归测试套件。

@@ -4,9 +4,9 @@
 
 # agent-relay
 
-> 一句话把任务交给合适的 Agent：跨 8 大 CLI 智能体的统一任务中继与委托执行器。
+> 一句话把任务交给合适的 Agent：跨 10 大 CLI 智能体的统一任务中继与委托执行器。
 
-`agent-relay` 让宿主 Agent（如 Google Antigravity、Claude Code 等）无需跳出终端，即可用自然语言将分析、审查、排查或编码任务委托给本机安装的其它外部 CLI Agent，并支持在原会话中无缝续接。
+`agent-relay` 让宿主 Agent（如 Qoder、Google Antigravity、Claude Code 等）无需跳出终端，即可用自然语言将分析、审查、排查或编码任务委托给本机安装的其它外部 CLI Agent，并支持在原会话中无缝续接。
 
 ---
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 支持的 8 大 CLI Agent
+## 支持的 10 大 CLI Agent
 
 支持全称及顺手简称，大小写不敏感：
 
@@ -35,6 +35,8 @@
 | **DeepSeek Harness** | `dsh`、`deepseek`、`deepseek-harness` | 复用 profile | read: `--permission-mode read-only`<br>write: `danger-full-access` | `--session-id <id>` |
 | **Grok Build** | `grok`、`grok-build` | 复用官方登录 | read: `--permission-mode plan`<br>write: `--always-approve` | `--resume <sessionId>` |
 | **Kimi Code** | `kimi`、`kimi-code` | 复用官方登录 | read: 明确拒绝（非交互非只读）<br>write: `-p` 原生 auto | `-S <session_id>` |
+| **ZCode** | `zcode`、`zc`、`zcode-cli` | 复用本地配置（支持 `zcode` CLI 或桌面端 `zcode.cjs`） | read: `--mode plan`<br>write: `--mode yolo` | `--resume <sessionId>` |
+| **Command Code** | `commandcode`、`command-code`、`cmd`、`cmdc` | 复用 `cmd login` / `COMMAND_CODE_API_KEY` | read: `--permission-mode plan`<br>write: `--yolo` | `--resume <sessionId>` |
 
 ---
 
@@ -53,6 +55,8 @@
 ```bash
 npx skills add qiq-mine/agent-relay
 ```
+
+在 **Qoder**（CLI / IDE）中作为发起方使用时，也可将本仓库直接放到 `~/.qoder/skills/agent-relay`（用户级）或 `.qoder/skills/agent-relay`（项目级），通过自然语言或 `/agent-relay` 触发。
 
 ### 2. 首次使用：自动探测与配置
 
@@ -81,6 +85,12 @@ Agent 会自动运行静默扫描，展示发现的 CLI 及版本，并询问两
 
 # 方案挑刺与审查
 用 agy 评审这个设计方案，重点挑刺边界情况与风险。
+
+# 指定 ZCode 修复并验证（或使用简称 zc）
+用 zcode 排查这个接口的超时问题并补齐单元测试。
+
+# 指定 Command Code 执行重构（或使用简称 cmd）
+用 commandcode 重构认证中间件为 async/await 并运行测试验证。
 
 # 续接上一次会话追问
 让 cc 针对刚才发现的第 2 点漏洞给出具体的修复补丁，并在原会话中继续。
@@ -120,13 +130,13 @@ Agent 会自动运行静默扫描，展示发现的 CLI 及版本，并询问两
 
 ## 自动化测试与质量保障
 
-项目内置完整的单元测试套件，全面覆盖 8 种 Runner 的命令拼装、权限拦截、状态回退与会话续接逻辑：
+项目内置完整的单元测试套件，全面覆盖 10 种 Runner 的命令拼装、权限拦截、状态回退与会话续接逻辑：
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试执行结果：**23 tests passed (100% OK)**。
+测试执行结果：**26 tests passed (100% OK)**。
 
 ---
 

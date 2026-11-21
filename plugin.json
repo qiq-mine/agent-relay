@@ -2,7 +2,7 @@
   "name": "agent-relay",
   "displayName": "Agent Relay",
   "version": "1.0.0",
-  "description": "跨 CLI Agent 任务中继与委托执行器：一句话统一调度 8 大终端 Agent (Claude Code / Codex / Antigravity / DSH / Grok / Kimi 等)，支持会话续接、角色路由与权限隔离。",
+  "description": "跨 CLI Agent 任务中继与委托执行器：一句话统一调度 10 大终端 Agent (Claude Code / Codex / Antigravity / DSH / Grok / Kimi / ZCode / Command Code 等)，支持会话续接、角色路由与权限隔离。",
   "author": {
     "name": "qiq-mine"
   },
@@ -17,6 +17,9 @@
     "grok",
     "kimi",
     "workbuddy",
+    "zcode",
+    "commandcode",
+    "qoder",
     "subagents",
     "cli-agents"
   ],
