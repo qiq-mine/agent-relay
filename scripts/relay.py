@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -96,6 +97,14 @@ RESUME_TEMPLATES = {
     "commandcode": ("{bin}", "--resume", "{sid}"),
 }
 NODE_SCRIPT_SUFFIXES = (".cjs", ".js", ".mjs")
+NODE_SCRIPT_RUNNERS = {"zcode", "commandcode"}
+WINDOWS_SHIM_SUFFIXES = (".cmd", ".bat")
+_CMD_SHIM_RE = re.compile(
+    r'(?:"%_prog%"|"%~dp0\\node\.exe"|\bnode(?:\.exe)?)\s+'
+    r'(?P<flags>(?:--[A-Za-z0-9_=./-]+\s+)*)'
+    r'"(?P<target>%(?:~?dp0)%?[^"\r\n]*\.(?:[cm]?js))"\s+%\*',
+    re.IGNORECASE,
+)
 EXIT_NEEDS_ONBOARDING = 10
 EXIT_NEEDS_RUNNER_CHOICE = 11
 EXIT_NEEDS_ROLE_CHOICE = 12
@@ -223,22 +232,64 @@ def find_node_binary() -> str | None:
     if found and is_executable(Path(found)):
         return found
     home = Path.home()
-    for directory in (
-        home / ".local" / "bin",
-        Path("/opt/homebrew/bin"),
-        Path("/usr/local/bin"),
-    ):
-        candidate = directory / "node"
-        if is_executable(candidate):
-            return str(candidate.resolve())
+    fallback_names = ("node.exe", "node") if sys.platform == "win32" else ("node",)
+    fallback_dirs = (
+        (
+            Path(r"C:\Program Files\nodejs"),
+            Path(r"C:\Program Files (x86)\nodejs"),
+            home / "AppData" / "Local" / "Programs" / "nodejs",
+        )
+        if sys.platform == "win32"
+        else (
+            home / ".local" / "bin",
+            Path("/opt/homebrew/bin"),
+            Path("/usr/local/bin"),
+        )
+    )
+    for directory in fallback_dirs:
+        for name in fallback_names:
+            candidate = directory / name
+            if is_executable(candidate):
+                return str(candidate.resolve())
+    return None
+
+
+def unwrap_windows_cmd_shim(path: Path) -> list[str] | None:
+    """Resolve npm/yarn/pnpm .cmd/.bat shims to [node, *flags, entry.js] to bypass cmd.exe."""
+    if not path.is_file() or path.suffix.lower() not in WINDOWS_SHIM_SUFFIXES:
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            content = handle.read(65536)
+    except OSError:
+        return None
+    for match in _CMD_SHIM_RE.finditer(content):
+        rel = re.sub(r"^%(?:~?dp0)%?", "", match.group("target"), flags=re.IGNORECASE)
+        rel = rel.replace("\\", "/").lstrip("/")
+        if not rel:
+            continue
+        target = (path.parent / rel).resolve()
+        if not target.is_file():
+            continue
+        node_bin: str | None = None
+        for local_name in ("node.exe", "node"):
+            local_node = path.parent / local_name
+            if is_executable(local_node):
+                node_bin = str(local_node.resolve())
+                break
+        node_bin = node_bin or find_node_binary()
+        if not node_bin:
+            return None
+        flags = match.group("flags").split()
+        return [node_bin, *flags, str(target)]
     return None
 
 
 def is_runner_usable(runner: str, path: Path) -> tuple[bool, str | None]:
-    if runner == "zcode" and is_node_script(path):
+    if runner in NODE_SCRIPT_RUNNERS and is_node_script(path):
         if find_node_binary():
             return True, None
-        return False, "Node.js ('node') is required to run ZCode .cjs/.js runtime but was not found"
+        return False, f"Node.js ('node') is required to run {runner} .cjs/.js runtime but was not found"
     if is_executable(path):
         return True, None
     return False, None
@@ -246,13 +297,16 @@ def is_runner_usable(runner: str, path: Path) -> tuple[bool, str | None]:
 
 def runner_exec_prefix(runner: str, binary: str) -> list[str]:
     path = Path(binary)
-    if runner == "zcode" and is_node_script(path):
+    if runner in NODE_SCRIPT_RUNNERS and is_node_script(path):
         node_bin = find_node_binary()
         if not node_bin:
             raise DelegateError(
-                "Node.js ('node') is required to run ZCode .cjs/.js runtime but was not found"
+                f"Node.js ('node') is required to run {runner} .cjs/.js runtime but was not found"
             )
         return [node_bin, binary]
+    unwrapped = unwrap_windows_cmd_shim(path)
+    if unwrapped:
+        return unwrapped
     return [binary]
 
 
@@ -372,13 +426,13 @@ def probe_version(path: str, runner: str = "") -> dict[str, Any]:
 def probe_dsh_capabilities(path: str) -> dict[str, bool | str | None]:
     try:
         proc = subprocess.run(
-            [path, "--profile", "headless", "--help"],
+            [*runner_exec_prefix("dsh", path), "--profile", "headless", "--help"],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, DelegateError) as exc:
         return {
             "json": False,
             "resume": False,
@@ -730,9 +784,10 @@ def build_invocation(
 ) -> tuple[list[str], str | None, dict[str, str]]:
     env: dict[str, str] = {}
     stdin_input: str | None = None
+    prefix = runner_exec_prefix(runner, binary)
 
     if runner == "claude":
-        cmd = [binary]
+        cmd = [*prefix]
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
@@ -744,7 +799,7 @@ def build_invocation(
         return cmd, stdin_input, env
 
     if runner == "workbuddy":
-        cmd = [binary]
+        cmd = [*prefix]
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
@@ -759,7 +814,7 @@ def build_invocation(
         return cmd, stdin_input, env
 
     if runner == "antigravity":
-        cmd = [binary]
+        cmd = [*prefix]
         if session_id:
             cmd.extend(["--conversation", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
@@ -772,13 +827,13 @@ def build_invocation(
         else:
             permission = ["--dangerously-bypass-approvals-and-sandbox"]
         if session_id:
-            cmd = [binary, "exec", "resume", "--json", "--skip-git-repo-check", *permission, session_id, "-"]
+            cmd = [*prefix, "exec", "resume", "--json", "--skip-git-repo-check", *permission, session_id, "-"]
         else:
-            cmd = [binary, "exec", "--cd", str(workspace), "--json", "--skip-git-repo-check", *permission, "-"]
+            cmd = [*prefix, "exec", "--cd", str(workspace), "--json", "--skip-git-repo-check", *permission, "-"]
         return cmd, prompt, env
 
     if runner == "grok":
-        cmd = [binary, "--cwd", str(workspace)]
+        cmd = [*prefix, "--cwd", str(workspace)]
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
@@ -790,14 +845,14 @@ def build_invocation(
             raise DelegateError(
                 "Kimi Code non-interactive mode uses auto permissions and cannot guarantee read-only"
             )
-        cmd = [binary]
+        cmd = [*prefix]
         if session_id:
             cmd.extend(["-S", session_id])
         cmd.extend(["-p", prompt, "--output-format", "stream-json"])
         return cmd, stdin_input, env
 
     if runner == "opencode":
-        cmd = [binary, "run", "--format", "json", "--dir", str(workspace)]
+        cmd = [*prefix, "run", "--format", "json", "--dir", str(workspace)]
         if session_id:
             cmd.extend(["--session", session_id])
         if mode == "read":
@@ -819,7 +874,7 @@ def build_invocation(
             raise DelegateError("This DSH headless installation lacks --json; upgrade DSH to use agent-relay")
         if session_id and not capabilities.get("resume"):
             raise DelegateError("This DSH headless installation lacks --session-id; upgrade DSH to resume sessions")
-        cmd = [binary, "--profile", "headless"]
+        cmd = [*prefix, "--profile", "headless"]
         permission = "read-only" if mode == "read" else "danger-full-access"
         if capabilities.get("permission_flag"):
             cmd.extend(["--permission-mode", permission])
@@ -833,7 +888,7 @@ def build_invocation(
         return cmd, prompt, env
 
     if runner == "zcode":
-        cmd = [*runner_exec_prefix("zcode", binary), "--cwd", str(workspace)]
+        cmd = [*prefix, "--cwd", str(workspace)]
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--json"])
@@ -841,12 +896,12 @@ def build_invocation(
         return cmd, stdin_input, env
 
     if runner == "commandcode":
-        cmd = [binary]
+        cmd = [*prefix, "--output-format", "json"]
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.extend(["-p", prompt, "--output-format", "json"])
         cmd.extend(["--permission-mode", "plan"] if mode == "read" else ["--yolo"])
-        return cmd, stdin_input, env
+        cmd.append("-p")
+        return cmd, prompt, env
 
     raise DelegateError(f"Unsupported runner: {runner}")
 
@@ -855,7 +910,7 @@ def resume_command(runner: str, binary: str, session_id: str | None) -> str | No
     if not session_id:
         return None
     path = Path(binary)
-    if runner == "zcode" and is_node_script(path):
+    if runner in NODE_SCRIPT_RUNNERS and is_node_script(path):
         return shlex.join(["node", binary, "--resume", session_id])
     # Standard executable names stay short; custom paths are kept in full so the command still works.
     name = path.name if path.name in RUNNER_BINARIES[runner] else binary

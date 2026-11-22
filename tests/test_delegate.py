@@ -475,6 +475,9 @@ class DelegateTestCase(unittest.TestCase):
                     self.assertFalse(any("inspect the fixture" in part for part in result["command"]))
                     if runner in ("codex", "dsh"):
                         self.assertEqual(result["command"][-1], "-")
+                    elif runner == "commandcode":
+                        self.assertEqual(result["command"][-1], "-p")
+                        self.assertIn("inspect the fixture", record["stdin"])
                     else:
                         self.assertIn("<prompt>", result["command"])
                     for artifact in (result["output_path"], result["events_path"], result["raw_stdout_path"], result["stderr_path"]):
@@ -1004,6 +1007,121 @@ class DelegateTestCase(unittest.TestCase):
                 result = self.result_of(proc)
                 self.assertEqual(result["status"], "failed")
                 self.assertIn(expected_msg, result["error"])
+
+    def test_windows_cmd_shim_unwrapping_and_commandcode_multiline_stdin(self) -> None:
+        if not DELEGATE.find_node_binary():
+            self.skipTest("node is not available")
+        npm_dir = self.root / "npm-global"
+        cc_dist = npm_dir / "node_modules" / "command-code" / "dist"
+        cc_dist.mkdir(parents=True)
+        cli_js = cc_dist / "cli.js"
+        cli_js.write_text(
+            "\n".join(
+                [
+                    "const fs = require('fs');",
+                    "const args = process.argv.slice(2);",
+                    "if (args.includes('--version')) { console.log('command-code 1.2.3'); process.exit(0); }",
+                    "const stdin = fs.readFileSync(0, 'utf8');",
+                    "const hasJson = args.includes('--output-format') && args[args.indexOf('--output-format') + 1] === 'json';",
+                    "const hasYolo = args.includes('--yolo');",
+                    "const hasPrint = args.includes('-p');",
+                    "if (!hasJson || !hasYolo || !hasPrint) { console.log('plain text fallback'); process.exit(0); }",
+                    "const lines = stdin.split(/\\r?\\n/).filter(Boolean);",
+                    "console.log(JSON.stringify({ type: 'event', event: { type: 'turn_start' } }));",
+                    "console.log(JSON.stringify({ type: 'result', subtype: 'success', sessionId: 'sess_win_01', stopReason: 'end_turn', finalText: 'lines=' + lines.length + '|third=' + lines[2] }));",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        shim_cmd = npm_dir / "command-code.CMD"
+        shim_cmd.write_text(
+            "\r\n".join(
+                [
+                    "@ECHO off",
+                    "GOTO start",
+                    ":find_dp0",
+                    "SET dp0=%~dp0",
+                    "EXIT /b",
+                    ":start",
+                    "SETLOCAL",
+                    "CALL :find_dp0",
+                    'SET "_prog=node"',
+                    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\command-code\\dist\\cli.js" %*',
+                ]
+            )
+            + "\r\n",
+            encoding="utf-8",
+        )
+        shim_cmd.chmod(0o755)
+
+        multiline_prompt = "第一行：普通中文。\n第二行：包含 %PATH% & | 特殊字符。\n第三行：最终验收条件。"
+        ran = self.run_cli(
+            "run",
+            "--runner",
+            "commandcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "write",
+            "--prompt",
+            multiline_prompt,
+            "--json",
+            extra_env={"AGENT_RELAY_COMMANDCODE_BIN": str(shim_cmd)},
+            remove_env=["OIL_DELEGATE_COMMANDCODE_BIN"],
+        )
+        self.assertEqual(ran.returncode, 0, msg=ran.stdout + ran.stderr)
+        payload = json.loads(ran.stdout)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["session_id"], "sess_win_01")
+        self.assertIn("third=第三行：最终验收条件。", payload["response"])
+        # Verify the .CMD shim was unwrapped to direct [node, cli.js, ...] and prompt went via stdin.
+        self.assertEqual(payload["command"][1], str(cli_js.resolve()))
+        self.assertEqual(payload["command"][-1], "-p")
+        self.assertNotIn("<prompt>", payload["command"])
+
+        # Also verify older %~dp0 shim format with extra node flags unwraps cleanly for argv-based runners.
+        zcode_dist = npm_dir / "node_modules" / "zcode-cli" / "dist"
+        zcode_dist.mkdir(parents=True)
+        zcode_js = zcode_dist / "zcode.cjs"
+        zcode_js.write_text(
+            "\n".join(
+                [
+                    "const args = process.argv.slice(2);",
+                    "const p = args[args.indexOf('-p') + 1] || '';",
+                    "console.log(JSON.stringify({ sessionId: 'sess_zc_win', response: 'got_lines=' + p.split('\\n').length, projection: { status: 'idle' } }));",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        zcode_cmd = npm_dir / "zcode.cmd"
+        zcode_cmd.write_text(
+            'node --no-warnings "%~dp0\\node_modules\\zcode-cli\\dist\\zcode.cjs" %*\r\n',
+            encoding="utf-8",
+        )
+        zcode_cmd.chmod(0o755)
+        unwrapped = DELEGATE.runner_exec_prefix("zcode", str(zcode_cmd))
+        self.assertEqual(unwrapped[1:], ["--no-warnings", str(zcode_js.resolve())])
+        z_ran = self.run_cli(
+            "run",
+            "--runner",
+            "zcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            multiline_prompt,
+            "--json",
+            extra_env={"AGENT_RELAY_ZCODE_BIN": str(zcode_cmd)},
+            remove_env=["OIL_DELEGATE_ZCODE_BIN"],
+        )
+        self.assertEqual(z_ran.returncode, 0, msg=z_ran.stdout + z_ran.stderr)
+        z_payload = json.loads(z_ran.stdout)
+        self.assertEqual(z_payload["status"], "completed")
+        self.assertIn("got_lines=", z_payload["response"])
+        self.assertEqual(z_payload["command"][1:3], ["--no-warnings", str(zcode_js.resolve())])
 
 
 if __name__ == "__main__":
