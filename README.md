@@ -132,7 +132,7 @@ Agent 会自动运行静默扫描，展示发现的 CLI 及版本，并询问两
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试执行结果：**29 tests passed (100% OK)**。
+测试执行结果：**31 tests passed (100% OK)**。
 
 ---
 

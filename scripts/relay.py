@@ -141,6 +141,12 @@ PROTOCOL_BLOCKED_FLAGS = {
     "-p",
     "--print",
 }
+RUNNER_PROTOCOL_ALLOWED_FLAGS = {
+    "codex": {"-c"},
+}
+RUNNER_PROTOCOL_BLOCKED_FLAGS = {
+    "grok": {"-s"},
+}
 READ_ONLY_BLOCKED_FLAGS = {
     "--yolo",
     "--dangerously-skip-permissions",
@@ -751,13 +757,33 @@ def parse_bin_assignment(value: str) -> tuple[str, str]:
     return runner, path.strip()
 
 
-def validate_extra_args(extra_args: list[str], mode: str | None) -> list[str]:
+def validate_extra_args(
+    extra_args: list[str],
+    mode: str | None,
+    runner: str | None = None,
+) -> list[str]:
     validated: list[str] = []
+    allowed_for_runner = RUNNER_PROTOCOL_ALLOWED_FLAGS.get(runner or "", set())
+    blocked_for_runner = RUNNER_PROTOCOL_BLOCKED_FLAGS.get(runner or "", set())
+    check_codex_config_next = False
     for raw in extra_args:
         token = str(raw)
+        if check_codex_config_next:
+            check_codex_config_next = False
+            lowered = token.lower()
+            if "sandbox" in lowered or "approval" in lowered:
+                raise DelegateError(
+                    f"Extra runner argument '{token}' cannot override sandbox or approval in read-only mode"
+                )
+            validated.append(token)
+            continue
         flag = token.split("=", 1)[0].strip()
         flag_lower = flag.lower()
-        if flag == "-S" or flag_lower in PROTOCOL_BLOCKED_FLAGS:
+        if (
+            flag == "-S"
+            or (flag_lower in PROTOCOL_BLOCKED_FLAGS and flag_lower not in allowed_for_runner)
+            or flag_lower in blocked_for_runner
+        ):
             raise DelegateError(
                 f"Extra runner argument '{flag}' conflicts with agent-relay protocol or session management"
             )
@@ -765,6 +791,15 @@ def validate_extra_args(extra_args: list[str], mode: str | None) -> list[str]:
             raise DelegateError(
                 f"Extra runner argument '{flag}' is forbidden in read-only mode"
             )
+        if runner == "codex" and mode == "read" and flag_lower in ("-c", "--config"):
+            if "=" in token:
+                lowered = token.lower()
+                if "sandbox" in lowered or "approval" in lowered:
+                    raise DelegateError(
+                        f"Extra runner argument '{token}' cannot override sandbox or approval in read-only mode"
+                    )
+            else:
+                check_codex_config_next = True
         validated.append(token)
     return validated
 
@@ -780,7 +815,7 @@ def parse_args_assignment(value: str) -> tuple[str, list[str]]:
         parsed = shlex.split(raw_args)
     except ValueError as exc:
         raise DelegateError(f"Invalid --set-args shell syntax for '{runner}': {exc}") from exc
-    return runner, validate_extra_args(parsed, mode=None)
+    return runner, validate_extra_args(parsed, mode=None, runner=runner)
 
 
 def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
@@ -898,13 +933,13 @@ def build_invocation(
     env: dict[str, str] = {}
     stdin_input: str | None = None
     prefix = runner_exec_prefix(runner, binary)
-    extra = validate_extra_args(list(extra_args or []), mode)
+    extra = validate_extra_args(list(extra_args or []), mode, runner=runner)
 
     if runner == "claude":
         cmd = [*prefix]
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.extend(["-p", prompt, "--output-format", "json"])
+        cmd.extend(["-p", prompt, "--output-format", "stream-json", "--verbose"])
         cmd.extend(
             ["--permission-mode", "plan", "--permission-prompts", "none"]
             if mode == "read"
@@ -917,7 +952,7 @@ def build_invocation(
         cmd = [*prefix]
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.extend(["-p", prompt, "--output-format", "json"])
+        cmd.extend(["-p", prompt, "--output-format", "stream-json", "--verbose"])
         cmd.extend(
             ["--permission-mode", "plan", "-y"]
             if mode == "read"
@@ -1131,21 +1166,43 @@ def parse_runner_output(
     error: str | None = None
     protocol_ok = True
 
-    if runner in ("claude", "workbuddy", "antigravity"):
+    if runner in ("claude", "workbuddy"):
+        events = json_events(raw_out)
+        result_obj: dict[str, Any] | None = None
+        for event in events:
+            session_id = nested_session_id(event) or session_id
+            if event.get("type") == "result":
+                result_obj = event
+        obj = result_obj or json_object(raw_out)
+        if not obj:
+            protocol_ok = False
+            error = "CLI did not return a JSON result"
+        else:
+            session_id = obj.get("session_id") or nested_session_id(obj) or session_id
+            response = str(obj.get("result") or "")
+            subtype = str(obj.get("subtype") or "").lower()
+            if subtype == "error_max_turns":
+                hint = (
+                    f"Resume with --session {session_id}, or pass -- --max-turns <N>."
+                    if session_id
+                    else "Pass -- --max-turns <N>."
+                )
+                error = f"{runner} reached max_turns limit. {hint}"
+            elif obj.get("is_error") or (subtype and subtype != "success"):
+                error = error_message(obj.get("error") or response or obj.get("subtype")) or "CLI reported an error"
+
+    elif runner == "antigravity":
+        for event in json_events(raw_out):
+            session_id = nested_session_id(event) or session_id
         obj = json_object(raw_out)
         if not obj:
             protocol_ok = False
             error = "CLI did not return a JSON result"
-        elif runner == "antigravity":
-            session_id = obj.get("conversation_id") or session_id
+        else:
+            session_id = obj.get("conversation_id") or nested_session_id(obj) or session_id
             response = str(obj.get("response") or "")
             if obj.get("status") != "SUCCESS":
                 error = error_message(obj.get("error") or obj.get("status"))
-        else:
-            session_id = obj.get("session_id") or session_id
-            response = str(obj.get("result") or "")
-            if obj.get("is_error"):
-                error = response or "CLI reported an error"
 
     elif runner == "grok":
         obj = json_object(raw_out)
@@ -1334,6 +1391,12 @@ def parse_runner_output(
             elif result_frame.get("stopReason") in ("cancelled", "refusal", "error"):
                 error = error_message(result_frame.get("error") or result_frame.get("stopReason"))
             protocol_ok = bool(session_id and not error and subtype in ("", "success") and response)
+
+    if not session_id:
+        for event in json_events(raw_out):
+            session_id = nested_session_id(event) or session_id
+    if not session_id:
+        session_id = extract_stderr_session_id(raw_err)
 
     status = (
         "completed"

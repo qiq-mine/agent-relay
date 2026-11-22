@@ -30,10 +30,10 @@
 ## Claude Code
 
 - 发现：`claude`。
-- 新建：`claude -p <prompt> --output-format json`；续接增加 `--resume <session_id>`。
+- 新建：`claude -p <prompt> --output-format stream-json --verbose`；续接增加 `--resume <session_id>`。首帧 `system/init` 即输出 `session_id`，超时或触发 `--max-turns` 时仍可保留 `session_id` 续接。
 - read：`--permission-mode plan --permission-prompts none`。
 - write：`--dangerously-skip-permissions`。
-- 解析：最终 JSON 的 `session_id`、`result`、`is_error`。
+- 解析：流中 `type: "result"` 帧的 `session_id`、`result`、`is_error`、`subtype`（兼容单对象 JSON；`error_max_turns` 提示续接或透传 `-- --max-turns <N>`）。
 - 认证：先用官方交互式 CLI 完成安装与登录；不要在包装器中输入或转存密钥。
 
 官方参考：[Claude Code CLI usage](https://docs.anthropic.com/en/docs/claude-code/cli-usage)。
@@ -41,11 +41,11 @@
 ## WorkBuddy
 
 - 发现：PATH 中的 `codebuddy` 或 `cbc`；macOS 还检测 WorkBuddy App 的 `Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`。Runner 名仍为 `workbuddy`。
-- 新建：`codebuddy -p <prompt> --output-format json`；续接增加 `--resume <session_id>`。
+- 新建：`codebuddy -p <prompt> --output-format stream-json --verbose`；续接增加 `--resume <session_id>`。
 - read：`--permission-mode plan -y`。`-y` 让读取等常规授权可无人值守，plan 限制实施修改。
 - write：`--permission-mode bypassPermissions -y`，并设置 `CODEBUDDY_IS_SANDBOX=1`，同时放行 HIGH/CRITICAL 操作。这是用户选择的最高权限模式，不代表进程实际处于隔离沙箱。
 - 进程环境：所有模式设置 `CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1`，避免 single-shot 模式不支持的后台任务。
-- 解析：与 Claude 兼容的最终 JSON 字段。
+- 解析：与 Claude 兼容的流式/最终 JSON 字段。
 - 认证：复用 WorkBuddy/CodeBuddy 已有登录。GUI 自动化不是后备方案。
 
 官方参考：[WorkBuddy Headless Mode](https://www.workbuddy.ai/docs/cli/headless)。

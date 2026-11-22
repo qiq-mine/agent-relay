@@ -140,8 +140,19 @@ if os.environ.get("FAKE_CODEX_FAIL_NO_DETAIL") == "1":
     print(json.dumps({{"type": "turn.failed"}}))
     raise SystemExit(0)
 
+if os.environ.get("FAKE_CLAUDE_STREAM_TIMEOUT"):
+    print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}), flush=True)
+    time.sleep(float(os.environ["FAKE_CLAUDE_STREAM_TIMEOUT"]))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_CLAUDE_MAX_TURNS"):
+    print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}))
+    print(json.dumps({{"type": "result", "subtype": "error_max_turns", "session_id": session, "is_error": True, "result": ""}}))
+    raise SystemExit(0)
+
 if runner in ("claude", "workbuddy"):
-    print(json.dumps({{"session_id": session, "result": "fake response", "is_error": False}}))
+    print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}))
+    print(json.dumps({{"type": "result", "subtype": "success", "session_id": session, "result": "fake response", "is_error": False}}))
 elif runner == "antigravity":
     print(json.dumps({{"conversation_id": session, "status": "SUCCESS", "response": "fake response"}}))
 elif runner == "grok":
@@ -1284,6 +1295,92 @@ class DelegateTestCase(unittest.TestCase):
         cleared = self.run_cli("config", "--clear-args", "commandcode")
         self.assertEqual(cleared.returncode, 0, msg=cleared.stderr)
         self.assertNotIn("commandcode", json.loads(cleared.stdout)["runner_args"])
+
+    def test_claude_stream_json_preserves_session_on_timeout_and_max_turns(self) -> None:
+        self.onboard_all()
+        timed = self.run_task(
+            "claude",
+            mode="write",
+            timeout="1",
+            extra_env={"FAKE_CLAUDE_STREAM_TIMEOUT": "3"},
+        )
+        self.assertEqual(timed.returncode, 124)
+        timed_result = self.result_of(timed)
+        self.assertEqual(timed_result["status"], "failed")
+        self.assertEqual(timed_result["session_id"], "fake-claude-session")
+        self.assertIn("--resume fake-claude-session", timed_result["resume_command"])
+
+        capped = self.run_task(
+            "workbuddy",
+            mode="write",
+            extra_env={"FAKE_CLAUDE_MAX_TURNS": "1"},
+        )
+        self.assertNotEqual(capped.returncode, 0)
+        capped_result = self.result_of(capped)
+        self.assertEqual(capped_result["status"], "failed")
+        self.assertEqual(capped_result["session_id"], "fake-workbuddy-session")
+        self.assertIn("max_turns", capped_result["error"])
+        self.assertIn("--max-turns", capped_result["error"])
+
+    def test_codex_config_flag_and_grok_session_guardrail(self) -> None:
+        self.onboard_all()
+        allowed = self.run_cli(
+            "run",
+            "--runner",
+            "codex",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "inspect",
+            "--dry-run",
+            "--json",
+            "--",
+            "-c",
+            'model="o3"',
+        )
+        self.assertEqual(allowed.returncode, 0, msg=allowed.stdout + allowed.stderr)
+        self.assertEqual(json.loads(allowed.stdout)["command"][-3:], ["-c", 'model="o3"', "-"])
+
+        for bad in (["-c", 'sandbox_mode="danger-full-access"'], ["-c", 'approval_policy="never"']):
+            with self.subTest(bad=bad):
+                blocked = self.run_cli(
+                    "run",
+                    "--runner",
+                    "codex",
+                    "--workspace",
+                    str(self.workspace),
+                    "--mode",
+                    "read",
+                    "--prompt",
+                    "inspect",
+                    "--dry-run",
+                    "--json",
+                    "--",
+                    *bad,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertIn("read-only mode", json.loads(blocked.stdout)["error"])
+
+        grok_blocked = self.run_cli(
+            "run",
+            "--runner",
+            "grok",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "inspect",
+            "--dry-run",
+            "--json",
+            "--",
+            "-s",
+            "custom-sid",
+        )
+        self.assertEqual(grok_blocked.returncode, 1)
+        self.assertIn("conflicts with agent-relay protocol", json.loads(grok_blocked.stdout)["error"])
 
 
 if __name__ == "__main__":
