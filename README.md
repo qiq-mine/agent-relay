@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="agent-relay：一句话把任务交给合适的 Agent，并在原会话中继续。">
-</p>
-
 # agent-relay
 
 > 一句话把任务交给合适的 Agent：跨 10 大 CLI 智能体的统一任务中继与委托执行器。
