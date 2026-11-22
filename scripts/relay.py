@@ -127,6 +127,60 @@ ROLE_SLOTS = {"diagnose": 2}
 HOST_AGENT = "host"
 READ_ONLY_UNSUPPORTED = {"kimi"}
 DEFAULT_RUN_TIMEOUT = 3600
+PROTOCOL_BLOCKED_FLAGS = {
+    "--output-format",
+    "--format",
+    "--json",
+    "--resume",
+    "-r",
+    "--session",
+    "--session-id",
+    "--conversation",
+    "-c",
+    "--continue",
+    "-p",
+    "--print",
+}
+READ_ONLY_BLOCKED_FLAGS = {
+    "--yolo",
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--always-approve",
+    "--auto",
+    "-y",
+    "--yes",
+    "--permission-mode",
+    "--permission-prompts",
+    "--mode",
+    "--sandbox",
+    "--approval-policy",
+    "--agent",
+    "--accept-edits",
+    "--dont-ask",
+}
+_STDERR_SESSION_RE = re.compile(
+    r"(?:^|\s)(?:session(?:[\s_-]?id)?\s*[:=]|--resume\s+)\s*([A-Za-z0-9][A-Za-z0-9._:-]{5,127})",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NON_SESSION_TOKENS = {
+    "aborted",
+    "cancelled",
+    "closed",
+    "completed",
+    "ended",
+    "error",
+    "failed",
+    "idle",
+    "invalid",
+    "missing",
+    "none",
+    "null",
+    "running",
+    "started",
+    "stopped",
+    "timeout",
+    "unknown",
+}
 
 
 class DelegateError(Exception):
@@ -144,6 +198,7 @@ def default_config() -> dict[str, Any]:
         "enabled_runners": [],
         "default_runner": None,
         "runner_paths": {},
+        "runner_args": {},
         "roles": {},
     }
 
@@ -174,6 +229,11 @@ def load_config(state_dir: Path) -> dict[str, Any]:
         raise DelegateError("config.enabled_runners must be a list")
     if not isinstance(merged.get("runner_paths"), dict):
         raise DelegateError("config.runner_paths must be an object")
+    if not isinstance(merged.get("runner_args"), dict):
+        raise DelegateError("config.runner_args must be an object")
+    for runner_key, raw_args in merged["runner_args"].items():
+        if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
+            raise DelegateError(f"config.runner_args.{runner_key} must be a list of strings")
     if not isinstance(merged.get("roles"), dict):
         raise DelegateError("config.roles must be an object")
     return merged
@@ -484,6 +544,7 @@ def onboarding_payload(state_dir: Path, config: dict[str, Any]) -> dict[str, Any
         "state_dir": str(state_dir),
         "enabled_runners": config.get("enabled_runners", []),
         "default_runner": config.get("default_runner"),
+        "runner_args": config.get("runner_args", {}),
         "roles": config.get("roles", {}),
         "installed_runners": [name for name, info in detected.items() if info["installed"]],
         "detected_runners": detected,
@@ -659,6 +720,7 @@ def config_view_payload(state_dir: Path, config: dict[str, Any]) -> dict[str, An
         "enabled_runners": config.get("enabled_runners", []),
         "default_runner": config.get("default_runner"),
         "runner_paths": config.get("runner_paths", {}),
+        "runner_args": config.get("runner_args", {}),
         "roles": config.get("roles", {}),
         "role_names": list(ROLE_MODES),
     }
@@ -689,6 +751,38 @@ def parse_bin_assignment(value: str) -> tuple[str, str]:
     return runner, path.strip()
 
 
+def validate_extra_args(extra_args: list[str], mode: str | None) -> list[str]:
+    validated: list[str] = []
+    for raw in extra_args:
+        token = str(raw)
+        flag = token.split("=", 1)[0].strip()
+        flag_lower = flag.lower()
+        if flag == "-S" or flag_lower in PROTOCOL_BLOCKED_FLAGS:
+            raise DelegateError(
+                f"Extra runner argument '{flag}' conflicts with agent-relay protocol or session management"
+            )
+        if mode == "read" and flag_lower in READ_ONLY_BLOCKED_FLAGS:
+            raise DelegateError(
+                f"Extra runner argument '{flag}' is forbidden in read-only mode"
+            )
+        validated.append(token)
+    return validated
+
+
+def parse_args_assignment(value: str) -> tuple[str, list[str]]:
+    if "=" not in value:
+        raise DelegateError('--set-args expects RUNNER="<args>", e.g. commandcode="--max-turns 200"')
+    runner_raw, raw_args = value.split("=", 1)
+    runner = canonical_runner(runner_raw)
+    if not raw_args.strip():
+        return runner, []
+    try:
+        parsed = shlex.split(raw_args)
+    except ValueError as exc:
+        raise DelegateError(f"Invalid --set-args shell syntax for '{runner}': {exc}") from exc
+    return runner, validate_extra_args(parsed, mode=None)
+
+
 def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
     config = load_config(state_dir)
     changed = any(
@@ -697,6 +791,8 @@ def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
             args.set_default_runner is not None,
             bool(args.set_bin),
             bool(args.clear_bin),
+            bool(args.set_args),
+            bool(args.clear_args),
             bool(args.set_role),
         )
     )
@@ -717,6 +813,22 @@ def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
         if runner in paths:
             del paths[runner]
             config["runner_paths"] = paths
+
+    for assignment in args.set_args or []:
+        runner, parsed_args = parse_args_assignment(assignment)
+        runner_args = dict(config.get("runner_args", {}))
+        if parsed_args:
+            runner_args[runner] = parsed_args
+        else:
+            runner_args.pop(runner, None)
+        config["runner_args"] = runner_args
+
+    for runner_raw in args.clear_args or []:
+        runner = canonical_runner(runner_raw)
+        runner_args = dict(config.get("runner_args", {}))
+        if runner in runner_args:
+            del runner_args[runner]
+            config["runner_args"] = runner_args
 
     if args.set_enabled_runners is not None:
         apply_enabled_runners(config, args.set_enabled_runners)
@@ -781,10 +893,12 @@ def build_invocation(
     session_id: str | None,
     mode: str,
     dsh_capabilities: dict[str, Any] | None,
+    extra_args: list[str] | None = None,
 ) -> tuple[list[str], str | None, dict[str, str]]:
     env: dict[str, str] = {}
     stdin_input: str | None = None
     prefix = runner_exec_prefix(runner, binary)
+    extra = validate_extra_args(list(extra_args or []), mode)
 
     if runner == "claude":
         cmd = [*prefix]
@@ -796,6 +910,7 @@ def build_invocation(
             if mode == "read"
             else ["--dangerously-skip-permissions"]
         )
+        cmd.extend(extra)
         return cmd, stdin_input, env
 
     if runner == "workbuddy":
@@ -808,6 +923,7 @@ def build_invocation(
             if mode == "read"
             else ["--permission-mode", "bypassPermissions", "-y"]
         )
+        cmd.extend(extra)
         env["CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         if mode == "write":
             env["CODEBUDDY_IS_SANDBOX"] = "1"
@@ -819,6 +935,7 @@ def build_invocation(
             cmd.extend(["--conversation", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
         cmd.extend(["--mode", "plan"] if mode == "read" else ["--dangerously-skip-permissions"])
+        cmd.extend(extra)
         return cmd, stdin_input, env
 
     if runner == "codex":
@@ -827,9 +944,9 @@ def build_invocation(
         else:
             permission = ["--dangerously-bypass-approvals-and-sandbox"]
         if session_id:
-            cmd = [*prefix, "exec", "resume", "--json", "--skip-git-repo-check", *permission, session_id, "-"]
+            cmd = [*prefix, "exec", "resume", "--json", "--skip-git-repo-check", *permission, *extra, session_id, "-"]
         else:
-            cmd = [*prefix, "exec", "--cd", str(workspace), "--json", "--skip-git-repo-check", *permission, "-"]
+            cmd = [*prefix, "exec", "--cd", str(workspace), "--json", "--skip-git-repo-check", *permission, *extra, "-"]
         return cmd, prompt, env
 
     if runner == "grok":
@@ -838,6 +955,7 @@ def build_invocation(
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--output-format", "json"])
         cmd.extend(["--permission-mode", "plan"] if mode == "read" else ["--always-approve"])
+        cmd.extend(extra)
         return cmd, stdin_input, env
 
     if runner == "kimi":
@@ -849,6 +967,7 @@ def build_invocation(
         if session_id:
             cmd.extend(["-S", session_id])
         cmd.extend(["-p", prompt, "--output-format", "stream-json"])
+        cmd.extend(extra)
         return cmd, stdin_input, env
 
     if runner == "opencode":
@@ -857,6 +976,7 @@ def build_invocation(
             cmd.extend(["--session", session_id])
         if mode == "read":
             cmd.extend(["--agent", "plan"])
+        cmd.extend(extra)
         cmd.append(prompt)
         permission = {
             "*": "allow",
@@ -884,6 +1004,7 @@ def build_invocation(
             cmd.extend(["--approval-policy", "never"])
         if session_id:
             cmd.extend(["--session-id", session_id])
+        cmd.extend(extra)
         cmd.extend(["--json", "-"])
         return cmd, prompt, env
 
@@ -893,13 +1014,15 @@ def build_invocation(
             cmd.extend(["--resume", session_id])
         cmd.extend(["-p", prompt, "--json"])
         cmd.extend(["--mode", "plan"] if mode == "read" else ["--mode", "yolo"])
+        cmd.extend(extra)
         return cmd, stdin_input, env
 
     if runner == "commandcode":
-        cmd = [*prefix, "--output-format", "json"]
+        cmd = [*prefix, "--output-format", "json", "--verbose"]
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.extend(["--permission-mode", "plan"] if mode == "read" else ["--yolo"])
+        cmd.extend(extra)
         cmd.append("-p")
         return cmd, prompt, env
 
@@ -986,6 +1109,14 @@ def error_message(value: Any) -> str | None:
             if found:
                 return found
     return str(value)
+
+
+def extract_stderr_session_id(raw_err: str) -> str | None:
+    for match in _STDERR_SESSION_RE.finditer(raw_err):
+        candidate = match.group(1).rstrip(".,;)]}")
+        if len(candidate) >= 6 and candidate.lower() not in _NON_SESSION_TOKENS:
+            return candidate
+    return None
 
 
 def parse_runner_output(
@@ -1151,12 +1282,26 @@ def parse_runner_output(
                 result_frame = event
             elif event.get("type") == "error":
                 error = error_message(event.get("error") or event.get("message") or event)
+        if result_frame:
+            session_id = result_frame.get("sessionId") or nested_session_id(result_frame) or session_id
+        if not session_id:
+            session_id = extract_stderr_session_id(raw_err)
         if not result_frame:
             protocol_ok = False
-            if not error:
+            if exit_code == 8:
+                if session_id:
+                    error = (
+                        f"Command Code reached max_turns limit (exit 8). "
+                        f"Resume with --session {session_id}, or raise the limit via -- --max-turns <N>."
+                    )
+                else:
+                    error = (
+                        "Command Code reached max_turns limit (exit 8) before emitting a session ID. "
+                        "Raise the limit via -- --max-turns <N>."
+                    )
+            elif not error:
                 error = "Command Code stream ended without a result frame"
         else:
-            session_id = result_frame.get("sessionId") or nested_session_id(result_frame) or session_id
             raw_text = result_frame.get("finalText")
             if raw_text is None:
                 raw_text = result_frame.get("result")
@@ -1170,6 +1315,15 @@ def parse_runner_output(
                     or result_frame.get("message")
                     or response
                     or "Command Code reported an error"
+                )
+            elif subtype == "max_turns" or exit_code == 8:
+                hint = (
+                    f"Resume with --session {session_id}, or pass -- --max-turns <N>."
+                    if session_id
+                    else "Pass -- --max-turns <N>."
+                )
+                error = (
+                    f"Command Code reached max_turns limit (exit {exit_code}). {hint}"
                 )
             elif subtype and subtype != "success":
                 error = error_message(
@@ -1248,6 +1402,11 @@ def execute_run(
     if not binary_info["installed"]:
         raise DelegateError(binary_info["error"] or f"Runner not installed: {runner}")
     capabilities = probe_dsh_capabilities(binary_info["path"]) if runner == "dsh" else None
+    configured_args = list(config.get("runner_args", {}).get(runner, []))
+    cli_extra_args = list(getattr(args, "runner_arg", None) or []) + list(
+        getattr(args, "passthrough_args", None) or []
+    )
+    extra_args = [*configured_args, *cli_extra_args]
     command, stdin_input, env_updates = build_invocation(
         runner,
         binary_info["path"],
@@ -1256,6 +1415,7 @@ def execute_run(
         args.session,
         args.mode,
         capabilities,
+        extra_args,
     )
     safe_command = redact_command(command, prompt)
 
@@ -1427,6 +1587,16 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--set-bin", action="append", help="RUNNER=/path/to/executable")
     config.add_argument("--clear-bin", action="append", help="Runner whose configured path should be cleared")
     config.add_argument(
+        "--set-args",
+        action="append",
+        help='RUNNER="<extra cli args>", e.g. commandcode="--max-turns 200"',
+    )
+    config.add_argument(
+        "--clear-args",
+        action="append",
+        help="Runner whose saved extra args should be cleared",
+    )
+    config.add_argument(
         "--set-role",
         action="append",
         help="ROLE=<runner|host|ask>; roles: review, critique, diagnose (two choices), implement",
@@ -1441,6 +1611,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--role-slot", type=int, default=1, help="Which saved choice to use for diagnose (1 or 2)")
     run.add_argument("--file", action="append")
     run.add_argument("--session")
+    run.add_argument(
+        "--runner-arg",
+        action="append",
+        default=[],
+        help="Repeatable extra CLI argument forwarded to the runner (or pass after '--')",
+    )
     run.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument(
@@ -1451,11 +1627,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def split_passthrough_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    if "--" in argv:
+        idx = argv.index("--")
+        return argv[:idx], argv[idx + 1 :]
+    return argv, []
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    relay_argv, passthrough = split_passthrough_argv(raw_argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(relay_argv)
+    args.passthrough_args = passthrough
     state_dir = resolve_state_dir(args.home)
     try:
+        if passthrough and args.command != "run":
+            raise DelegateError("Extra runner arguments after '--' are only supported with 'run'")
         if args.command == "onboard":
             return cmd_onboard(args, state_dir)
         if args.command == "config":

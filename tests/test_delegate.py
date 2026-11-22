@@ -126,6 +126,12 @@ if os.environ.get("FAKE_COMMANDCODE_ERROR"):
         print(json.dumps({{"type": "result", "subtype": "max_turns", "sessionId": session, "finalText": "partial"}}))
     elif err_kind == "no_result":
         print(json.dumps({{"type": "event", "event": {{"type": "tool_running", "toolName": "read_file"}}}}))
+    elif err_kind == "exit8_no_result":
+        if "--verbose" in args:
+            sys.stderr.write("session: " + session + "\n")
+        sys.stderr.write("Reached max turns limit (100). Re-run with --max-turns 200.\n")
+        print(json.dumps({{"type": "event", "event": {{"type": "tool_running", "toolName": "read_file"}}}}))
+        raise SystemExit(8)
     raise SystemExit(0)
 
 if os.environ.get("FAKE_CODEX_FAIL_NO_DETAIL") == "1":
@@ -1122,6 +1128,162 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(z_payload["status"], "completed")
         self.assertIn("got_lines=", z_payload["response"])
         self.assertEqual(z_payload["command"][1:3], ["--no-warnings", str(zcode_js.resolve())])
+
+    def test_commandcode_exit8_recovers_session_from_stderr_and_resumes(self) -> None:
+        self.onboard_all()
+        record_path = self.root / "record.json"
+        proc = self.run_cli(
+            "run",
+            "--runner",
+            "commandcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "write",
+            "--prompt",
+            "large refactor",
+            "--json",
+            extra_env={
+                "FAKE_RECORD": str(record_path),
+                "FAKE_COMMANDCODE_ERROR": "exit8_no_result",
+            },
+        )
+        self.assertEqual(proc.returncode, 8)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["exit_code"], 8)
+        self.assertEqual(payload["session_id"], "fake-commandcode-session")
+        self.assertIn("--resume fake-commandcode-session", payload["resume_command"])
+        self.assertIn("max_turns", payload["error"])
+        self.assertIn("--max-turns", payload["error"])
+        self.assertIn("--verbose", self.record_of()["argv"])
+
+        # Now resume that recovered session while forwarding --max-turns 200.
+        resumed = self.run_cli(
+            "run",
+            "--runner",
+            "commandcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "write",
+            "--session",
+            payload["session_id"],
+            "--prompt",
+            "continue remaining steps",
+            "--json",
+            "--",
+            "--max-turns",
+            "200",
+            extra_env={"FAKE_RECORD": str(record_path)},
+        )
+        self.assertEqual(resumed.returncode, 0, msg=resumed.stdout + resumed.stderr)
+        resumed_payload = json.loads(resumed.stdout)
+        self.assertEqual(resumed_payload["status"], "completed")
+        self.assertEqual(resumed_payload["session_id"], "fake-commandcode-session")
+        argv = self.record_of()["argv"]
+        self.assertEqual(argv[-3:], ["--max-turns", "200", "-p"])
+
+    def test_extra_runner_args_passthrough_config_and_guardrails(self) -> None:
+        self.onboard_all()
+
+        # Persist default runner args via config --set-args and combine with per-run args.
+        saved = self.run_cli("config", "--set-args", "commandcode=--max-turns 200")
+        self.assertEqual(saved.returncode, 0, msg=saved.stderr)
+        self.assertEqual(
+            json.loads(saved.stdout)["runner_args"]["commandcode"],
+            ["--max-turns", "200"],
+        )
+
+        dry_cc = self.run_cli(
+            "run",
+            "--runner",
+            "commandcode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "write",
+            "--prompt",
+            "inspect",
+            "--runner-arg=--add-dir",
+            "--runner-arg=../shared",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(dry_cc.returncode, 0, msg=dry_cc.stdout + dry_cc.stderr)
+        cc_cmd = json.loads(dry_cc.stdout)["command"]
+        self.assertEqual(cc_cmd[-5:], ["--max-turns", "200", "--add-dir", "../shared", "-p"])
+
+        # Sentinel ordering for codex ('-' at end) and opencode (prompt at end).
+        dry_codex = self.run_cli(
+            "run",
+            "--runner",
+            "codex",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "inspect",
+            "--dry-run",
+            "--json",
+            "--",
+            "--model",
+            "o3",
+        )
+        self.assertEqual(dry_codex.returncode, 0, msg=dry_codex.stdout + dry_codex.stderr)
+        codex_cmd = json.loads(dry_codex.stdout)["command"]
+        self.assertEqual(codex_cmd[-3:], ["--model", "o3", "-"])
+
+        dry_oc = self.run_cli(
+            "run",
+            "--runner",
+            "opencode",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "inspect",
+            "--dry-run",
+            "--json",
+            "--",
+            "--model",
+            "provider/demo",
+        )
+        self.assertEqual(dry_oc.returncode, 0, msg=dry_oc.stdout + dry_oc.stderr)
+        oc_cmd = json.loads(dry_oc.stdout)["command"]
+        self.assertEqual(oc_cmd[-3:], ["--model", "provider/demo", "<prompt>"])
+
+        # Guardrails: read-only mode blocks permission escalation; all modes block protocol flags.
+        for bad_args, expected_err in (
+            (["--yolo"], "forbidden in read-only mode"),
+            (["--permission-mode=yolo"], "forbidden in read-only mode"),
+            (["--output-format", "text"], "conflicts with agent-relay protocol"),
+            (["--resume", "other"], "conflicts with agent-relay protocol"),
+        ):
+            with self.subTest(bad_args=bad_args):
+                blocked = self.run_cli(
+                    "run",
+                    "--runner",
+                    "commandcode",
+                    "--workspace",
+                    str(self.workspace),
+                    "--mode",
+                    "read",
+                    "--prompt",
+                    "inspect",
+                    "--dry-run",
+                    "--json",
+                    "--",
+                    *bad_args,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertIn(expected_err, json.loads(blocked.stdout)["error"])
+
+        cleared = self.run_cli("config", "--clear-args", "commandcode")
+        self.assertEqual(cleared.returncode, 0, msg=cleared.stderr)
+        self.assertNotIn("commandcode", json.loads(cleared.stdout)["runner_args"])
 
 
 if __name__ == "__main__":

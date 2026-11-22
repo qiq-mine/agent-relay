@@ -21,7 +21,7 @@
 
 正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`、`zcode`、`commandcode`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy/anti`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`、`zc/zcode-cli`、`command-code/cmd/cmdc/cmdcode`。名称不区分大小写；启用、默认 Runner、单次委托和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
 
-优先级：环境变量 `AGENT_RELAY_<RUNNER>_BIN`（兼容 `OIL_DELEGATE_<RUNNER>_BIN`）→ 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell；在 Windows 上遇到 npm/yarn/pnpm 生成的 `.cmd`/`.bat` 批处理垫层时，会自动解包为直接调用 `node <entry.js>` 以绕开 `cmd.exe` 对换行与特殊字符的截断。常规调用不指定模型、provider 或思考强度。
+优先级：环境变量 `AGENT_RELAY_<RUNNER>_BIN`（兼容 `OIL_DELEGATE_<RUNNER>_BIN`）→ 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell；在 Windows 上遇到 npm/yarn/pnpm 生成的 `.cmd`/`.bat` 批处理垫层时，会自动解包为直接调用 `node <entry.js>` 以绕开 `cmd.exe` 对换行与特殊字符的截断。常规调用不指定模型、provider 或思考强度；需要透传目标 CLI 特有参数（如 `--max-turns 200`）时，可通过 `run ... -- <args>`、`--runner-arg` 或 `config --set-args <runner>="<args>"` 传入（自动拦截破坏协议/会话的参数，且在 `read` 模式下禁止透传任何提权/放宽沙箱参数）。
 
 省略 `--mode` 时默认 `write`，使用各 CLI 的最高可用权限，尽量避免无人值守任务停在常规审批。只有用户明确要求只读、plan 或限制权限时才使用 `read`。权限参数只影响当前进程，不修改目标 CLI 的永久配置。
 
@@ -133,10 +133,10 @@
 ## Command Code
 
 - 发现：PATH 中的 `command-code`、`commandcode`、`cmd`（仅 macOS/Linux/WSL，Windows 上自动跳过 `cmd` 以免误命中系统 `cmd.exe`）或 `cmdc`；若为 Windows `.CMD` 批处理垫层会自动解包为直启 `node <entry.js>`，也可直接指定 `.js/.cjs/.mjs` 入口。Runner 名为 `commandcode`，接受 `command-code`、`cmd`、`cmdc`、`cmdcode`。
-- 新建：`command-code --output-format json ... -p`（以目标 workspace 为 cwd，prompt 通过 `stdin` 传入，彻底避免命令行换行截断）；续接增加 `--resume <sessionId>`。
+- 新建：`command-code --output-format json --verbose ... -p`（以目标 workspace 为 cwd，prompt 通过 `stdin` 传入，彻底避免命令行换行截断）；续接增加 `--resume <sessionId>`。
 - read：`--permission-mode plan`（只读规划模式，且 headless 默认禁止写入/命令修改）。
 - write：`--yolo`（等价 `--dangerously-skip-permissions`，放行写入与命令执行；静态 `deny` 规则与安全熔断仍有效）。
-- 解析：NDJSON 流中的最终 `type: "result"` 帧，读取 `sessionId`、`finalText`、`subtype`（仅 `success` 视为成功；`error`、`max_turns` 或缺少 `result` 帧均判失败）与 `error`。
+- 解析：NDJSON 流中的最终 `type: "result"` 帧，读取 `sessionId`、`finalText`、`subtype`（仅 `success` 视为成功；`error`、`max_turns` 或缺少 `result` 帧均判失败）与 `error`。当因达到 `max-turns` 上限（默认 100 turns，`exit 8`）或超时导致结果帧未输出时，自动从 `--verbose` 的 `stderr` 日志兜底提取 `session_id`，确保可直接 `--session <id>` 续接或通过 `-- --max-turns 200`（或 `config --set-args commandcode="--max-turns 200"`）提高上限。
 - 认证：本地通过 `cmd login` 缓存认证（`~/.commandcode/auth.json`），无头/CI 环境可使用 `COMMAND_CODE_API_KEY` 环境变量；包装器不读取或转存密钥。
 
 官方参考：[Command Code Docs](https://commandcode.ai/docs)。

@@ -60,11 +60,13 @@ metadata:
 
 未指定 runner 且没有默认值时，`run` 返回 `NEEDS_RUNNER_CHOICE`。询问本次选择；只有用户同意沉淀偏好时，才运行 `RELAY config --set-default-runner <runner>`。
 
-查看配置或指定非标准二进制路径：
+查看配置、指定非标准二进制路径或设置默认透传参数：
 
 ```text
 RELAY config
 RELAY config --set-bin <runner>=<可执行文件绝对路径>
+RELAY config --set-args <runner>="--max-turns 200"
+RELAY config --clear-args <runner>
 ```
 
 ### 2. 派发新任务
@@ -81,7 +83,7 @@ RELAY run --runner <名称> \
   --prompt "<目标、边界、完成标准与真实验证命令>"
 ```
 
-已配置默认 runner 时省略 `--runner`。启动前需要核对参数时追加 `--dry-run`；预览不会启动外部 Agent。
+已配置默认 runner 时省略 `--runner`。启动前需要核对参数时追加 `--dry-run`；预览不会启动外部 Agent。需要向目标 CLI 透传额外参数（如 Command Code 放宽 `--max-turns 200`）时，在命令末尾加 `-- <参数...>` 或使用可重复的 `--runner-arg`（只读模式下会拦截提权参数，所有模式均拦截破坏协议/会话的参数）。
 
 ### 按角色委托
 
